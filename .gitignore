@@ -27,3 +27,6 @@ go.work
 *~
 
 examples/**
+
+.claude/
+CLAUDE.md
