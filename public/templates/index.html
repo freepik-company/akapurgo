@@ -37,10 +37,16 @@
 
         <!-- Request Post Purge Checkbox -->
         <div class="post-request-checkbox">
-            <input type="checkbox" id="post-request" name="post-request" required>
+            <input type="checkbox" id="post-request" name="post-request">
             <label for="post-request">Execute request post purge (only with url purge type)</label>
         </div>
-        
+
+        <!-- IM Bypass Checkbox -->
+        <div class="post-request-checkbox">
+            <input type="checkbox" id="im-bypass" name="im-bypass">
+            <label for="im-bypass">Duplicate URLs with imbypass=true query parameter</label>
+        </div>
+
         <label for="paths">Enter paths/tags to purge (one per line):</label>
         <textarea id="paths" name="paths" placeholder="https://domain.com/example/path1
 https://domain.com/example/path2"></textarea>

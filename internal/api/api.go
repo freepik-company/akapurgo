@@ -48,6 +48,11 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 			})
 		}
 
+		// Duplicate URLs with imbypass=true query parameter if requested
+		if req.ImBypass && req.PurgeType == "urls" {
+			req.Paths = duplicatePathsWithImBypass(req.Paths)
+		}
+
 		// Determine the Akamai API URL
 		if req.PurgeType == "urls" {
 			purgeURL = fmt.Sprintf("%s/ccu/v3/%s/url/%s", ctx.Config.Akamai.Host, req.ActionType, req.Environment)
@@ -167,4 +172,26 @@ func executePurgeRequest(paths []string, ctx v1alpha1.Context) {
 
 func is2xx(status int) bool {
 	return status >= 200 && status < 300
+}
+
+func duplicatePathsWithImBypass(paths []string) []string {
+	duplicatedPaths := make([]string, 0, len(paths)*2)
+
+	for _, path := range paths {
+		// Add original URL
+		duplicatedPaths = append(duplicatedPaths, path)
+
+		// Add URL with imbypass=true query parameter
+		duplicatedPaths = append(duplicatedPaths, addQueryParam(path, "imbypass", "true"))
+	}
+
+	return duplicatedPaths
+}
+
+func addQueryParam(urlStr, key, value string) string {
+	separator := "?"
+	if bytes.Contains([]byte(urlStr), []byte("?")) {
+		separator = "&"
+	}
+	return fmt.Sprintf("%s%s%s=%s", urlStr, separator, key, value)
 }

@@ -13,6 +13,7 @@ type PurgeRequest struct {
 	ActionType       string   `json:"actionType"`                 // "invalidate" or "delete"
 	Environment      string   `json:"environment"`                // "production" or "staging"
 	PostPurgeRequest bool     `json:"postPurgeRequest,omitempty"` // true or false
+	ImBypass         bool     `json:"imBypass,omitempty"`         // true or false
 	Paths            []string `json:"paths"`
 }
 
