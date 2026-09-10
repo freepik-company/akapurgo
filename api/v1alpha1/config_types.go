@@ -15,8 +15,9 @@ type ConfigSpec struct {
 		AccessToken  string `yaml:"access_token"`
 	} `yaml:"akamai"`
 	PostPurgeRequest struct {
-		Enabled bool              `yaml:"enabled"`
-		Headers map[string]string `yaml:"headers"`
+		Enabled   bool              `yaml:"enabled"`
+		UserAgent string            `yaml:"user_agent"`
+		Headers   map[string]string `yaml:"headers"`
 	} `yaml:"post_purge_request"`
 	Logs struct {
 		ShowAccessLogs bool `yaml:"show_access_logs"`

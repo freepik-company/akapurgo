@@ -11,6 +11,9 @@ akamai:
 
 post_purge_request:
   enabled: true
+  # Optional. Defaults to "akapurgo". Some CDNs (Akamai among them) reject the
+  # Go default User-Agent with a 403, so the request never reaches the origin.
+  #user_agent: "akapurgo"
   headers:
     X-Custom-Header: "value"
 
