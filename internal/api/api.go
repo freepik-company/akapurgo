@@ -3,6 +3,7 @@ package api
 import (
 	"akapurgo/api/v1alpha1"
 	"akapurgo/internal/commons"
+	"akapurgo/internal/origincache"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -19,14 +20,25 @@ import (
 // the origin. Send our own unless the configuration overrides it.
 const defaultPostPurgeUserAgent = "akapurgo"
 
-var (
-	akamaiResp v1alpha1.AkamaiResponse
-	req        v1alpha1.PurgeRequest
-	purgeURL   string
-	resp       *http.Response
-)
-
 func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
+	var originCacheClient *origincache.Client
+	var originCacheConfigError error
+	if ctx.Config.OriginCachePurge.Enabled {
+		originCacheClient, originCacheConfigError = origincache.NewClient(origincache.Config{
+			Endpoints:             ctx.Config.OriginCachePurge.Endpoints,
+			Token:                 ctx.Config.OriginCachePurge.Token,
+			Timeout:               time.Duration(ctx.Config.OriginCachePurge.TimeoutSeconds) * time.Second,
+			TotalTimeout:          time.Duration(ctx.Config.OriginCachePurge.TotalTimeoutSeconds) * time.Second,
+			InsecureSkipTLSVerify: ctx.Config.OriginCachePurge.InsecureSkipTLSVerify,
+		})
+		if ctx.Config.OriginCachePurge.InsecureSkipTLSVerify {
+			ctx.Logger.Warn("Origin cache purge TLS certificate verification is disabled")
+		}
+		if originCacheConfigError != nil {
+			ctx.Logger.Errorf("Origin cache purge is enabled with invalid configuration: %v", originCacheConfigError)
+		}
+	}
+
 	return func(c *fiber.Ctx) error {
 
 		// Verify the Content-Type header
@@ -46,6 +58,7 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 		}
 
 		// Parse the JSON body from the request and validate the body
+		var req v1alpha1.PurgeRequest
 		if err := c.BodyParser(&req); err != nil {
 			ctx.Logger.Errorf("Failed to parse request: %v\n", err)
 			return c.Status(fiber.StatusBadRequest).JSON(map[string]string{
@@ -59,6 +72,7 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 		}
 
 		// Determine the Akamai API URL
+		var purgeURL string
 		if req.PurgeType == "urls" {
 			purgeURL = fmt.Sprintf("%s/ccu/v3/%s/url/%s", ctx.Config.Akamai.Host, req.ActionType, req.Environment)
 		} else if req.PurgeType == "cache-tags" {
@@ -68,6 +82,42 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusBadRequest).JSON(map[string]string{
 				"error": "Invalid purge type",
 			})
+		}
+
+		// Purge the private origin cache before Akamai. Otherwise Akamai can
+		// refill its cache from a stale origin entry immediately after its own
+		// purge completes.
+		if len(req.OriginCachePurge) > 0 {
+			if req.PurgeType != "urls" {
+				return c.Status(fiber.StatusBadRequest).JSON(map[string]string{
+					"error": "Origin cache purge is only supported for URL purges",
+				})
+			}
+			if !ctx.Config.OriginCachePurge.Enabled {
+				return c.Status(fiber.StatusBadRequest).JSON(map[string]string{
+					"error": "Origin cache purge is not enabled",
+				})
+			}
+			if len(req.OriginCachePurge) > origincache.MaxEntries {
+				return c.Status(fiber.StatusBadRequest).JSON(map[string]string{
+					"error": fmt.Sprintf("Origin cache purge supports at most %d entries", origincache.MaxEntries),
+				})
+			}
+			if originCacheConfigError != nil {
+				ctx.Logger.Errorf("Invalid origin cache purge configuration: %v", originCacheConfigError)
+				return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{
+					"error": "Invalid origin cache purge configuration",
+				})
+			}
+
+			if err := originCacheClient.Purge(c.UserContext(), req.OriginCachePurge); err != nil {
+				ctx.Logger.Errorf("Failed to purge origin cache: %v", err)
+				return c.Status(fiber.StatusBadGateway).JSON(map[string]string{
+					"error": "Failed to purge origin cache",
+				})
+			}
+			ctx.Logger.Infof("Purged %d object(s) from %d origin cache endpoint(s)",
+				len(req.OriginCachePurge), len(ctx.Config.OriginCachePurge.Endpoints))
 		}
 
 		// Create the payload for Akamai
@@ -110,7 +160,7 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 		apiRequest.Header.Set("Content-Type", "application/json")
 
 		// Send the request to Akamai
-		resp, err = client.Do(apiRequest)
+		resp, err := client.Do(apiRequest)
 		if err != nil {
 			ctx.Logger.Errorf("Failed to send request to Akamai: %v\n", err)
 			return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{
@@ -121,6 +171,7 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 		defer resp.Body.Close()
 
 		// Decode the Akamai response
+		var akamaiResp v1alpha1.AkamaiResponse
 		if err := json.NewDecoder(resp.Body).Decode(&akamaiResp); err != nil {
 			ctx.Logger.Errorf("Failed to decode Akamai response: %v\n", err)
 			return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{

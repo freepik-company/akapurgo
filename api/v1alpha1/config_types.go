@@ -19,6 +19,14 @@ type ConfigSpec struct {
 		UserAgent string            `yaml:"user_agent"`
 		Headers   map[string]string `yaml:"headers"`
 	} `yaml:"post_purge_request"`
+	OriginCachePurge struct {
+		Enabled               bool     `yaml:"enabled"`
+		Endpoints             []string `yaml:"endpoints"`
+		Token                 string   `yaml:"token"`
+		TimeoutSeconds        int      `yaml:"timeout_seconds"`
+		TotalTimeoutSeconds   int      `yaml:"total_timeout_seconds"`
+		InsecureSkipTLSVerify bool     `yaml:"insecure_skip_tls_verify"`
+	} `yaml:"origin_cache_purge"`
 	Logs struct {
 		ShowAccessLogs bool `yaml:"show_access_logs"`
 		JwtUser        struct {

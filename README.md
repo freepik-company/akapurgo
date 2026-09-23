@@ -79,12 +79,32 @@ For purging content, the application provides a POST endpoint at `/api/v1/purge`
     "purgeType": "urls", // "urls" or "cache-tags"
     "actionType": "invalidate", // "invalidate" or "delete"
     "environment": "production", // "production" or "staging"
+    "postPurgeRequest": true,
     "paths": [ // List of paths to purge or cache tags to delete (depending on the purgeType)
       "/path1",
       "/path2"
+    ],
+    "originCachePurge": [ // Optional storage keys for direct origin-cache eviction
+      {
+        "bucketOvh": "fc-gra-fp-2000",
+        "pathOvh": "/52683/180/179253.jpg",
+        "bucketGcs": "fc-europe-west1-fp",
+        "pathGcs": "/2000/52683/180/179253.jpg"
+      }
     ]
 }
 ```
+
+When `originCachePurge` is present and `origin_cache_purge.enabled` is configured,
+Akapurgo evicts every object from every configured origin-cache endpoint before
+calling Akamai. Any origin-cache failure stops the request with HTTP 502, which
+prevents Akamai from immediately refilling its cache from a stale origin entry.
+The storage object must already have been deleted or updated before making this
+request. Existing clients that omit `originCachePurge` keep the previous
+Akamai-only behavior. A request accepts at most 100 origin entries, and the
+server-wide `total_timeout_seconds` budget bounds the complete fan-out across
+all configured endpoints.
+
 ## Logging
 The project includes extensive logging capabilities. The logs can be configured in the config.yaml file under the logs section.  Example log fields:  
 * REQUEST:method: HTTP method of the request.
