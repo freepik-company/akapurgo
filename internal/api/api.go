@@ -14,6 +14,11 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
+// Akamai rejects requests carrying Go's default User-Agent
+// ("Go-http-client/1.1") with a 403, so the post-purge request never reached
+// the origin. Send our own unless the configuration overrides it.
+const defaultPostPurgeUserAgent = "akapurgo"
+
 var (
 	akamaiResp v1alpha1.AkamaiResponse
 	req        v1alpha1.PurgeRequest
@@ -145,6 +150,14 @@ func executePurgeRequest(paths []string, ctx v1alpha1.Context) {
 			ctx.Logger.Errorf("Failed to create GET request for %s: %v\n", path, err)
 			continue
 		}
+
+		// Identify ourselves before applying the configured headers, so those
+		// can still override the User-Agent when needed.
+		userAgent := ctx.Config.PostPurgeRequest.UserAgent
+		if userAgent == "" {
+			userAgent = defaultPostPurgeUserAgent
+		}
+		getRequest.Header.Set("User-Agent", userAgent)
 
 		// Add custom headers from configuration
 		for key, value := range ctx.Config.PostPurgeRequest.Headers {
