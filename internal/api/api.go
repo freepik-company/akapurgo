@@ -231,7 +231,7 @@ func executeOriginPurgeRequest(
 			continue
 		}
 
-		if !is2xx(response.StatusCode) {
+		if !isSuccessfulOriginPurgeStatus(response.StatusCode) {
 			requestErrors = append(requestErrors,
 				fmt.Errorf("origin purge request %d returned status %d", index, response.StatusCode))
 			continue
@@ -286,8 +286,12 @@ func validateOriginPurgeURL(rawURL string, allowedHosts map[string]struct{}) (*u
 	return parsedURL, nil
 }
 
-func is2xx(status int) bool {
-	return status >= 200 && status < 300
+func isSuccessfulOriginPurgeStatus(status int) bool {
+	// ngx_cache_purge returns 404 or 412, depending on its version, when the
+	// entry is already absent. Purging is idempotent, so both are successful.
+	return status >= 200 && status < 300 ||
+		status == http.StatusNotFound ||
+		status == http.StatusPreconditionFailed
 }
 
 func duplicatePathsWithImBypass(paths []string) []string {
