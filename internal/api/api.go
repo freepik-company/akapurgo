@@ -200,7 +200,8 @@ func executeOriginPurgeRequest(
 			requestContext, http.MethodGet, validatedURL.String(), nil,
 		)
 		if err != nil {
-			requestErrors = append(requestErrors, fmt.Errorf("create origin purge request %d: %w", index, err))
+			requestErrors = append(requestErrors,
+				sanitizeOriginPurgeRequestError(index, validatedURL, err))
 			continue
 		}
 
@@ -220,7 +221,8 @@ func executeOriginPurgeRequest(
 		// Send the GET request
 		response, err := client.Do(getRequest)
 		if err != nil {
-			requestErrors = append(requestErrors, fmt.Errorf("send origin purge request %d: %w", index, err))
+			requestErrors = append(requestErrors,
+				sanitizeOriginPurgeRequestError(index, validatedURL, err))
 			continue
 		}
 
@@ -292,6 +294,16 @@ func isSuccessfulOriginPurgeStatus(status int) bool {
 	return status >= 200 && status < 300 ||
 		status == http.StatusNotFound ||
 		status == http.StatusPreconditionFailed
+}
+
+func sanitizeOriginPurgeRequestError(index int, requestURL *url.URL, err error) error {
+	var urlError *url.Error
+	if errors.As(err, &urlError) {
+		err = urlError.Err
+	}
+
+	return fmt.Errorf("send origin purge request %d to %s%s: %v",
+		index, requestURL.Host, requestURL.EscapedPath(), err)
 }
 
 func duplicatePathsWithImBypass(paths []string) []string {
