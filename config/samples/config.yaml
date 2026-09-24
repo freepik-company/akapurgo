@@ -11,11 +11,16 @@ akamai:
 
 post_purge_request:
   enabled: true
-  # Optional. Defaults to "akapurgo". Some CDNs (Akamai among them) reject the
-  # Go default User-Agent with a 403, so the request never reaches the origin.
+  # The request runs before the Akamai API purge. Akamai can use its headers to
+  # resolve the public URL and invalidate a private origin cache first.
+  timeout_seconds: 10
+  # Required allowlist: prevents arbitrary server-side requests and token leaks.
+  allowed_hosts:
+    - "img.example.com"
+  # Defaults to "akapurgo". Akamai rejects Go's default User-Agent with a 403.
   #user_agent: "akapurgo"
   headers:
-    X-Custom-Header: "value"
+    X-OVH-Purge: "$OVH_PURGE_TOKEN"
 
 logs:
   show_access_logs: true

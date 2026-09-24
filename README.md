@@ -79,12 +79,23 @@ For purging content, the application provides a POST endpoint at `/api/v1/purge`
     "purgeType": "urls", // "urls" or "cache-tags"
     "actionType": "invalidate", // "invalidate" or "delete"
     "environment": "production", // "production" or "staging"
+    "originPurgeRequest": true,
     "paths": [ // List of paths to purge or cache tags to delete (depending on the purgeType)
-      "/path1",
-      "/path2"
+      "https://img.example.com/path1.jpg",
+      "https://img.example.com/path2.jpg"
     ]
 }
 ```
+
+When `originPurgeRequest` and `post_purge_request.enabled` are true, Akapurgo sends
+the configured request to every URL before calling the Akamai purge API. This
+allows an Akamai property to bypass its edge cache, resolve the public URL to
+the corresponding storage headers and evict a private origin cache first. If
+that request fails or returns a non-2xx status, Akapurgo returns HTTP 502 and
+does not continue with the Akamai purge. URLs must use HTTPS and match the
+configured `post_purge_request.allowed_hosts` allowlist. The legacy
+`postPurgeRequest` field remains accepted for backward compatibility.
+
 ## Logging
 The project includes extensive logging capabilities. The logs can be configured in the config.yaml file under the logs section.  Example log fields:  
 * REQUEST:method: HTTP method of the request.
