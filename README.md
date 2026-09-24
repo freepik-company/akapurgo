@@ -79,31 +79,22 @@ For purging content, the application provides a POST endpoint at `/api/v1/purge`
     "purgeType": "urls", // "urls" or "cache-tags"
     "actionType": "invalidate", // "invalidate" or "delete"
     "environment": "production", // "production" or "staging"
-    "postPurgeRequest": true,
+    "originPurgeRequest": true,
     "paths": [ // List of paths to purge or cache tags to delete (depending on the purgeType)
-      "/path1",
-      "/path2"
-    ],
-    "originCachePurge": [ // Optional storage keys for direct origin-cache eviction
-      {
-        "bucketOvh": "fc-gra-fp-2000",
-        "pathOvh": "/52683/180/179253.jpg",
-        "bucketGcs": "fc-europe-west1-fp",
-        "pathGcs": "/2000/52683/180/179253.jpg"
-      }
+      "https://img.example.com/path1.jpg",
+      "https://img.example.com/path2.jpg"
     ]
 }
 ```
 
-When `originCachePurge` is present and `origin_cache_purge.enabled` is configured,
-Akapurgo evicts every object from every configured origin-cache endpoint before
-calling Akamai. Any origin-cache failure stops the request with HTTP 502, which
-prevents Akamai from immediately refilling its cache from a stale origin entry.
-The storage object must already have been deleted or updated before making this
-request. Existing clients that omit `originCachePurge` keep the previous
-Akamai-only behavior. A request accepts at most 100 origin entries, and the
-server-wide `total_timeout_seconds` budget bounds the complete fan-out across
-all configured endpoints.
+When `originPurgeRequest` and `post_purge_request.enabled` are true, Akapurgo sends
+the configured request to every URL before calling the Akamai purge API. This
+allows an Akamai property to bypass its edge cache, resolve the public URL to
+the corresponding storage headers and evict a private origin cache first. If
+that request fails or returns a non-2xx status, Akapurgo returns HTTP 502 and
+does not continue with the Akamai purge. URLs must use HTTPS and match the
+configured `post_purge_request.allowed_hosts` allowlist. The legacy
+`postPurgeRequest` field remains accepted for backward compatibility.
 
 ## Logging
 The project includes extensive logging capabilities. The logs can be configured in the config.yaml file under the logs section.  Example log fields:  

@@ -3,12 +3,15 @@ package api
 import (
 	"akapurgo/api/v1alpha1"
 	"akapurgo/internal/commons"
-	"akapurgo/internal/origincache"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/akamai/AkamaiOPEN-edgegrid-golang/v9/pkg/edgegrid"
@@ -19,25 +22,22 @@ import (
 // ("Go-http-client/1.1") with a 403, so the post-purge request never reached
 // the origin. Send our own unless the configuration overrides it.
 const defaultPostPurgeUserAgent = "akapurgo"
+const defaultOriginPurgeTimeout = 10 * time.Second
+const akamaiRequestTimeout = 30 * time.Second
+const maxResponseBodySize = 1 << 20
+const maxOriginPurgeURLs = 100
 
 func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
-	var originCacheClient *origincache.Client
-	var originCacheConfigError error
-	if ctx.Config.OriginCachePurge.Enabled {
-		originCacheClient, originCacheConfigError = origincache.NewClient(origincache.Config{
-			Endpoints:             ctx.Config.OriginCachePurge.Endpoints,
-			Token:                 ctx.Config.OriginCachePurge.Token,
-			Timeout:               time.Duration(ctx.Config.OriginCachePurge.TimeoutSeconds) * time.Second,
-			TotalTimeout:          time.Duration(ctx.Config.OriginCachePurge.TotalTimeoutSeconds) * time.Second,
-			InsecureSkipTLSVerify: ctx.Config.OriginCachePurge.InsecureSkipTLSVerify,
-		})
-		if ctx.Config.OriginCachePurge.InsecureSkipTLSVerify {
-			ctx.Logger.Warn("Origin cache purge TLS certificate verification is disabled")
-		}
-		if originCacheConfigError != nil {
-			ctx.Logger.Errorf("Origin cache purge is enabled with invalid configuration: %v", originCacheConfigError)
-		}
+	originPurgeTimeout := time.Duration(ctx.Config.PostPurgeRequest.TimeoutSeconds) * time.Second
+	if originPurgeTimeout <= 0 {
+		originPurgeTimeout = defaultOriginPurgeTimeout
 	}
+	allowedOriginHosts, allowedHostsError := buildAllowedHosts(ctx.Config.PostPurgeRequest.AllowedHosts)
+	if ctx.Config.PostPurgeRequest.Enabled && allowedHostsError != nil {
+		ctx.Logger.Errorf("Invalid origin purge host configuration: %v", allowedHostsError)
+	}
+	originPurgeClient := newOriginPurgeHTTPClient(originPurgeTimeout)
+	akamaiClient := &http.Client{Timeout: akamaiRequestTimeout}
 
 	return func(c *fiber.Ctx) error {
 
@@ -66,6 +66,8 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 			})
 		}
 
+		originPaths := append([]string(nil), req.Paths...)
+
 		// Duplicate URLs with imbypass=true query parameter if requested
 		if req.ImBypass && req.PurgeType == "urls" {
 			req.Paths = duplicatePathsWithImBypass(req.Paths)
@@ -84,40 +86,25 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 			})
 		}
 
-		// Purge the private origin cache before Akamai. Otherwise Akamai can
-		// refill its cache from a stale origin entry immediately after its own
-		// purge completes.
-		if len(req.OriginCachePurge) > 0 {
-			if req.PurgeType != "urls" {
-				return c.Status(fiber.StatusBadRequest).JSON(map[string]string{
-					"error": "Origin cache purge is only supported for URL purges",
-				})
-			}
-			if !ctx.Config.OriginCachePurge.Enabled {
-				return c.Status(fiber.StatusBadRequest).JSON(map[string]string{
-					"error": "Origin cache purge is not enabled",
-				})
-			}
-			if len(req.OriginCachePurge) > origincache.MaxEntries {
-				return c.Status(fiber.StatusBadRequest).JSON(map[string]string{
-					"error": fmt.Sprintf("Origin cache purge supports at most %d entries", origincache.MaxEntries),
-				})
-			}
-			if originCacheConfigError != nil {
-				ctx.Logger.Errorf("Invalid origin cache purge configuration: %v", originCacheConfigError)
+		// A request carrying X-OVH-Purge bypasses Akamai, lets the property
+		// derive the storage headers from the public URL, selects the same
+		// dd-gra node as regular traffic and rewrites the path to /purge/....
+		// Do this before purging Akamai so it cannot refill from stale origin.
+		originPurgeRequested := req.OriginPurgeRequest || req.PostPurgeRequest
+		if originPurgeRequested && ctx.Config.PostPurgeRequest.Enabled && req.PurgeType == "urls" {
+			if allowedHostsError != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{
-					"error": "Invalid origin cache purge configuration",
+					"error": "Invalid origin purge host configuration",
 				})
 			}
-
-			if err := originCacheClient.Purge(c.UserContext(), req.OriginCachePurge); err != nil {
-				ctx.Logger.Errorf("Failed to purge origin cache: %v", err)
+			if err := executeOriginPurgeRequest(
+				c.UserContext(), originPaths, ctx, originPurgeClient, allowedOriginHosts,
+			); err != nil {
+				ctx.Logger.Errorf("Failed to purge origin cache through Akamai: %v", err)
 				return c.Status(fiber.StatusBadGateway).JSON(map[string]string{
 					"error": "Failed to purge origin cache",
 				})
 			}
-			ctx.Logger.Infof("Purged %d object(s) from %d origin cache endpoint(s)",
-				len(req.OriginCachePurge), len(ctx.Config.OriginCachePurge.Endpoints))
 		}
 
 		// Create the payload for Akamai
@@ -135,8 +122,9 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 		}
 
 		// Create the HTTP request to Akamai
-		client := &http.Client{}
-		apiRequest, err := http.NewRequest("POST", purgeURL, bytes.NewReader(payloadBytes))
+		apiRequest, err := http.NewRequestWithContext(
+			c.UserContext(), http.MethodPost, purgeURL, bytes.NewReader(payloadBytes),
+		)
 		if err != nil {
 			ctx.Logger.Errorf("Failed to create HTTP request: %v\n", err)
 			return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{
@@ -160,7 +148,7 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 		apiRequest.Header.Set("Content-Type", "application/json")
 
 		// Send the request to Akamai
-		resp, err := client.Do(apiRequest)
+		resp, err := akamaiClient.Do(apiRequest)
 		if err != nil {
 			ctx.Logger.Errorf("Failed to send request to Akamai: %v\n", err)
 			return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{
@@ -179,26 +167,40 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 			})
 		}
 
-		// Send a GET requests to purged URLs
-		if is2xx(akamaiResp.HTTPStatus) && req.PostPurgeRequest && ctx.Config.PostPurgeRequest.Enabled {
-			time.Sleep(5 * time.Second) // Wait for 5 seconds before sending GET requests
-			executePurgeRequest(req.Paths, ctx)
-		}
-
 		// Forward the Akamai response to the client
 		ctx.Logger.Infof(`akamai-response,detail='%s',status=%d`, akamaiResp.Detail, akamaiResp.HTTPStatus)
 		return c.Status(resp.StatusCode).JSON(akamaiResp)
 	}
 }
 
-func executePurgeRequest(paths []string, ctx v1alpha1.Context) {
-	client := &http.Client{}
+func executeOriginPurgeRequest(
+	requestContext context.Context,
+	paths []string,
+	ctx v1alpha1.Context,
+	client *http.Client,
+	allowedHosts map[string]struct{},
+) error {
+	if len(paths) > maxOriginPurgeURLs {
+		return fmt.Errorf("origin purge supports at most %d URLs", maxOriginPurgeURLs)
+	}
 
-	for _, path := range paths {
-		// Create the HTTP GET request
-		getRequest, err := http.NewRequest("GET", path, nil)
+	validatedURLs := make([]*url.URL, 0, len(paths))
+	for index, path := range paths {
+		validatedURL, err := validateOriginPurgeURL(path, allowedHosts)
 		if err != nil {
-			ctx.Logger.Errorf("Failed to create GET request for %s: %v\n", path, err)
+			return fmt.Errorf("invalid origin purge URL at index %d: %w", index, err)
+		}
+		validatedURLs = append(validatedURLs, validatedURL)
+	}
+
+	var requestErrors []error
+
+	for index, validatedURL := range validatedURLs {
+		getRequest, err := http.NewRequestWithContext(
+			requestContext, http.MethodGet, validatedURL.String(), nil,
+		)
+		if err != nil {
+			requestErrors = append(requestErrors, fmt.Errorf("create origin purge request %d: %w", index, err))
 			continue
 		}
 
@@ -218,20 +220,70 @@ func executePurgeRequest(paths []string, ctx v1alpha1.Context) {
 		// Send the GET request
 		response, err := client.Do(getRequest)
 		if err != nil {
-			ctx.Logger.Errorf("Failed to send GET request to %s: %v\n", path, err)
+			requestErrors = append(requestErrors, fmt.Errorf("send origin purge request %d: %w", index, err))
 			continue
 		}
 
-		// Read and discard the body to complete the request properly
-		_, err = io.ReadAll(response.Body)
-		if err != nil {
-			ctx.Logger.Warnf("Failed to read response body from %s: %v\n", path, err)
-		}
+		_, readErr := io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBodySize))
 		response.Body.Close()
+		if readErr != nil {
+			requestErrors = append(requestErrors, fmt.Errorf("read origin purge response %d: %w", index, readErr))
+			continue
+		}
 
-		// Log the response status
-		ctx.Logger.Infof("GET request to %s returned status code %d\n", path, response.StatusCode)
+		if !is2xx(response.StatusCode) {
+			requestErrors = append(requestErrors,
+				fmt.Errorf("origin purge request %d returned status %d", index, response.StatusCode))
+			continue
+		}
+
+		ctx.Logger.Infof("Origin purge request to %s%s returned status code %d",
+			validatedURL.Host, validatedURL.EscapedPath(), response.StatusCode)
 	}
+
+	return errors.Join(requestErrors...)
+}
+
+func buildAllowedHosts(hosts []string) (map[string]struct{}, error) {
+	if len(hosts) == 0 {
+		return nil, errors.New("post_purge_request.allowed_hosts must not be empty")
+	}
+
+	allowedHosts := make(map[string]struct{}, len(hosts))
+	for _, host := range hosts {
+		normalizedHost := strings.ToLower(strings.TrimSpace(host))
+		if normalizedHost == "" || strings.ContainsAny(normalizedHost, "/@\r\n") {
+			return nil, fmt.Errorf("invalid allowed host")
+		}
+		allowedHosts[normalizedHost] = struct{}{}
+	}
+	return allowedHosts, nil
+}
+
+func newOriginPurgeHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func validateOriginPurgeURL(rawURL string, allowedHosts map[string]struct{}) (*url.URL, error) {
+	parsedURL, err := url.ParseRequestURI(rawURL)
+	if err != nil {
+		return nil, errors.New("invalid URL")
+	}
+	if parsedURL.Scheme != "https" || parsedURL.Host == "" {
+		return nil, errors.New("URL must be absolute and use HTTPS")
+	}
+	if parsedURL.User != nil {
+		return nil, errors.New("URL credentials are not allowed")
+	}
+	if _, allowed := allowedHosts[strings.ToLower(parsedURL.Host)]; !allowed {
+		return nil, errors.New("URL host is not allowed")
+	}
+	return parsedURL, nil
 }
 
 func is2xx(status int) bool {

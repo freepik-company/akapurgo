@@ -9,20 +9,15 @@ type Context struct {
 }
 
 type PurgeRequest struct {
-	PurgeType        string                    `json:"purgeType"`                  // "urls" or "cache-tags"
-	ActionType       string                    `json:"actionType"`                 // "invalidate" or "delete"
-	Environment      string                    `json:"environment"`                // "production" or "staging"
-	PostPurgeRequest bool                      `json:"postPurgeRequest,omitempty"` // true or false
-	ImBypass         bool                      `json:"imBypass,omitempty"`         // true or false
-	Paths            []string                  `json:"paths"`
-	OriginCachePurge []OriginCachePurgeRequest `json:"originCachePurge,omitempty"`
-}
-
-type OriginCachePurgeRequest struct {
-	BucketOVH string `json:"bucketOvh"`
-	PathOVH   string `json:"pathOvh"`
-	BucketGCS string `json:"bucketGcs"`
-	PathGCS   string `json:"pathGcs"`
+	PurgeType          string `json:"purgeType"`   // "urls" or "cache-tags"
+	ActionType         string `json:"actionType"`  // "invalidate" or "delete"
+	Environment        string `json:"environment"` // "production" or "staging"
+	OriginPurgeRequest bool   `json:"originPurgeRequest,omitempty"`
+	// PostPurgeRequest is kept for API compatibility. It now triggers the same
+	// pre-Akamai origin purge as OriginPurgeRequest.
+	PostPurgeRequest bool     `json:"postPurgeRequest,omitempty"`
+	ImBypass         bool     `json:"imBypass,omitempty"` // true or false
+	Paths            []string `json:"paths"`
 }
 
 type AkamaiResponse struct {
