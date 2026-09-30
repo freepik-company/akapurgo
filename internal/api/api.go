@@ -32,12 +32,26 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 	if originPurgeTimeout <= 0 {
 		originPurgeTimeout = defaultOriginPurgeTimeout
 	}
+	return purgeHandler(ctx, newOriginPurgeHTTPClient(originPurgeTimeout),
+		&http.Client{Timeout: akamaiRequestTimeout}, signAkamaiRequest)
+}
+
+func signAkamaiRequest(request *http.Request) error {
+	edgerc, err := edgegrid.New(edgegrid.WithFile(commons.AkamaiConfigPath))
+	if err != nil {
+		return err
+	}
+	edgerc.SignRequest(request)
+	return nil
+}
+
+func purgeHandler(ctx v1alpha1.Context, originPurgeClient, akamaiClient *http.Client,
+	signRequest func(*http.Request) error,
+) func(c *fiber.Ctx) error {
 	allowedOriginHosts, allowedHostsError := buildAllowedHosts(ctx.Config.PostPurgeRequest.AllowedHosts)
 	if ctx.Config.PostPurgeRequest.Enabled && allowedHostsError != nil {
 		ctx.Logger.Errorf("Invalid origin purge host configuration: %v", allowedHostsError)
 	}
-	originPurgeClient := newOriginPurgeHTTPClient(originPurgeTimeout)
-	akamaiClient := &http.Client{Timeout: akamaiRequestTimeout}
 
 	return func(c *fiber.Ctx) error {
 
@@ -65,6 +79,12 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 				"error": "Invalid request payload",
 			})
 		}
+		if (req.ActionType != "invalidate" && req.ActionType != "delete") ||
+			(req.Environment != "production" && req.Environment != "staging") || len(req.Paths) == 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(map[string]string{
+				"error": "Invalid action, environment or empty paths",
+			})
+		}
 
 		originPaths := append([]string(nil), req.Paths...)
 
@@ -86,25 +106,41 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 			})
 		}
 
-		// A request carrying X-OVH-Purge bypasses Akamai, lets the property
-		// derive the storage headers from the public URL, selects the same
-		// dd-gra node as regular traffic and rewrites the path to /purge/....
-		// Do this before purging Akamai so it cannot refill from stale origin.
+		// Try the origin first to avoid refilling the edge from stale content.
+		// If the attempt fails, still submit CCU as a best-effort eviction, but
+		// keep the overall request failed so callers retry the origin as well.
 		originPurgeRequested := req.OriginPurgeRequest || req.PostPurgeRequest
+		var originErrors []originPurgeFailure
 		if originPurgeRequested && ctx.Config.PostPurgeRequest.Enabled && req.PurgeType == "urls" {
 			if allowedHostsError != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{
 					"error": "Invalid origin purge host configuration",
 				})
 			}
-			if err := executeOriginPurgeRequest(
-				c.UserContext(), originPaths, ctx, originPurgeClient, allowedOriginHosts,
-			); err != nil {
-				ctx.Logger.Errorf("Failed to purge origin cache through Akamai: %v", err)
-				return c.Status(fiber.StatusBadGateway).JSON(map[string]string{
-					"error": "Failed to purge origin cache",
+			validatedURLs, err := validateOriginPurgeURLs(originPaths, allowedOriginHosts)
+			if err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(map[string]string{
+					"error": err.Error(),
 				})
 			}
+			originErrors = executeOriginPurgeRequest(c.UserContext(), validatedURLs, ctx, originPurgeClient)
+			if len(originErrors) > 0 {
+				ctx.Logger.Errorf("Failed to purge origin cache through Akamai: %v", originErrors)
+			}
+		}
+
+		// Preserve the legacy response when the origin succeeds or is not requested.
+		// Partial failures expose CCU's outcome without treating acceptance as completion.
+		ccuHTTPStatus := 0
+		respond := func(status int, body interface{}, ccuStatus string) error {
+			if len(originErrors) > 0 {
+				return c.Status(fiber.StatusBadGateway).JSON(map[string]interface{}{
+					"error":  "Failed to purge origin cache",
+					"origin": map[string]interface{}{"status": "failed", "failures": originErrors},
+					"akamai": map[string]interface{}{"status": ccuStatus, "httpStatus": ccuHTTPStatus, "response": body},
+				})
+			}
+			return c.Status(status).JSON(body)
 		}
 
 		// Create the payload for Akamai
@@ -116,9 +152,9 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 		payloadBytes, err := json.Marshal(akamaiPayload)
 		if err != nil {
 			ctx.Logger.Errorf("Failed to marshal payload: %v\n", err)
-			return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{
+			return respond(fiber.StatusInternalServerError, map[string]string{
 				"error": "Failed to encode payload",
-			})
+			}, "not_attempted")
 		}
 
 		// Create the HTTP request to Akamai
@@ -127,22 +163,20 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 		)
 		if err != nil {
 			ctx.Logger.Errorf("Failed to create HTTP request: %v\n", err)
-			return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{
+			return respond(fiber.StatusInternalServerError, map[string]string{
 				"error": "Failed to create request",
-			})
+			}, "not_attempted")
 		}
 
 		// Generate the Authorization header with the edgerc Akamai library and the configuration file
 		// generated previously or loaded from the environment
 		// https://github.com/akamai/AkamaiOPEN-edgegrid-golang
-		edgerc, err := edgegrid.New(edgegrid.WithFile(commons.AkamaiConfigPath))
-		if err != nil {
+		if err := signRequest(apiRequest); err != nil {
 			ctx.Logger.Errorf("Failed to sign the request with given credentials: %v\n", err)
-			return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{
+			return respond(fiber.StatusInternalServerError, map[string]string{
 				"error": "Failed to sign the request with given credentials",
-			})
+			}, "not_attempted")
 		}
-		edgerc.SignRequest(apiRequest)
 
 		// Set required headers
 		apiRequest.Header.Set("Content-Type", "application/json")
@@ -151,57 +185,77 @@ func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 		resp, err := akamaiClient.Do(apiRequest)
 		if err != nil {
 			ctx.Logger.Errorf("Failed to send request to Akamai: %v\n", err)
-			return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{
+			return respond(fiber.StatusInternalServerError, map[string]string{
 				"error": "Failed to communicate with Akamai",
-			})
+			}, "unknown")
 		}
 
 		defer resp.Body.Close()
+		ccuHTTPStatus = resp.StatusCode
 
 		// Decode the Akamai response
 		var akamaiResp v1alpha1.AkamaiResponse
 		if err := json.NewDecoder(resp.Body).Decode(&akamaiResp); err != nil {
 			ctx.Logger.Errorf("Failed to decode Akamai response: %v\n", err)
-			return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{
+			return respond(fiber.StatusInternalServerError, map[string]string{
 				"error": "Failed to decode Akamai response",
-			})
+			}, "unknown")
 		}
 
 		// Forward the Akamai response to the client
 		ctx.Logger.Infof(`akamai-response,detail='%s',status=%d`, akamaiResp.Detail, akamaiResp.HTTPStatus)
-		return c.Status(resp.StatusCode).JSON(akamaiResp)
+		ccuStatus := "failed"
+		if resp.StatusCode == http.StatusCreated && akamaiResp.HTTPStatus == http.StatusCreated {
+			ccuStatus = "accepted"
+		}
+		return respond(resp.StatusCode, akamaiResp, ccuStatus)
 	}
 }
 
-func executeOriginPurgeRequest(
-	requestContext context.Context,
-	paths []string,
-	ctx v1alpha1.Context,
-	client *http.Client,
-	allowedHosts map[string]struct{},
-) error {
+func validateOriginPurgeURLs(paths []string, allowedHosts map[string]struct{}) ([]*url.URL, error) {
 	if len(paths) > maxOriginPurgeURLs {
-		return fmt.Errorf("origin purge supports at most %d URLs", maxOriginPurgeURLs)
+		return nil, fmt.Errorf("origin purge supports at most %d URLs", maxOriginPurgeURLs)
 	}
 
 	validatedURLs := make([]*url.URL, 0, len(paths))
 	for index, path := range paths {
 		validatedURL, err := validateOriginPurgeURL(path, allowedHosts)
 		if err != nil {
-			return fmt.Errorf("invalid origin purge URL at index %d: %w", index, err)
+			return nil, fmt.Errorf("invalid origin purge URL at index %d: %w", index, err)
 		}
 		validatedURLs = append(validatedURLs, validatedURL)
 	}
 
-	var requestErrors []error
+	return validatedURLs, nil
+}
+
+type originPurgeFailure struct {
+	Index      int    `json:"index"`
+	Host       string `json:"host"`
+	HTTPStatus int    `json:"httpStatus,omitempty"`
+	Reason     string `json:"reason"`
+}
+
+func (failure originPurgeFailure) Error() string {
+	return fmt.Sprintf("origin purge request %d to %s: %s (HTTP %d)",
+		failure.Index, failure.Host, failure.Reason, failure.HTTPStatus)
+}
+
+func executeOriginPurgeRequest(
+	requestContext context.Context,
+	validatedURLs []*url.URL,
+	ctx v1alpha1.Context,
+	client *http.Client,
+) []originPurgeFailure {
+	var requestErrors []originPurgeFailure
 
 	for index, validatedURL := range validatedURLs {
 		getRequest, err := http.NewRequestWithContext(
 			requestContext, http.MethodGet, validatedURL.String(), nil,
 		)
 		if err != nil {
-			requestErrors = append(requestErrors,
-				sanitizeOriginPurgeRequestError(index, validatedURL, err))
+			ctx.Logger.Error(sanitizeOriginPurgeRequestError(index, validatedURL, err))
+			requestErrors = append(requestErrors, originPurgeFailure{Index: index, Host: validatedURL.Host, Reason: "Failed to create origin request"})
 			continue
 		}
 
@@ -221,21 +275,22 @@ func executeOriginPurgeRequest(
 		// Send the GET request
 		response, err := client.Do(getRequest)
 		if err != nil {
-			requestErrors = append(requestErrors,
-				sanitizeOriginPurgeRequestError(index, validatedURL, err))
+			ctx.Logger.Error(sanitizeOriginPurgeRequestError(index, validatedURL, err))
+			requestErrors = append(requestErrors, originPurgeFailure{Index: index, Host: validatedURL.Host, Reason: "Failed to communicate with origin"})
 			continue
 		}
 
 		_, readErr := io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBodySize))
 		response.Body.Close()
 		if readErr != nil {
-			requestErrors = append(requestErrors, fmt.Errorf("read origin purge response %d: %w", index, readErr))
+			requestErrors = append(requestErrors, originPurgeFailure{Index: index, Host: validatedURL.Host,
+				HTTPStatus: response.StatusCode, Reason: "Failed to read origin response"})
 			continue
 		}
 
 		if !isSuccessfulOriginPurgeStatus(response.StatusCode) {
-			requestErrors = append(requestErrors,
-				fmt.Errorf("origin purge request %d returned status %d", index, response.StatusCode))
+			requestErrors = append(requestErrors, originPurgeFailure{Index: index, Host: validatedURL.Host,
+				HTTPStatus: response.StatusCode, Reason: "Origin returned an unsuccessful status"})
 			continue
 		}
 
@@ -243,7 +298,7 @@ func executeOriginPurgeRequest(
 			validatedURL.Host, validatedURL.EscapedPath(), response.StatusCode)
 	}
 
-	return errors.Join(requestErrors...)
+	return requestErrors
 }
 
 func buildAllowedHosts(hosts []string) (map[string]struct{}, error) {

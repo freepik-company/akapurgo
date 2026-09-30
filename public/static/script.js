@@ -34,11 +34,21 @@ document.getElementById('purge-form').addEventListener('submit', async function(
         });
 
         if (response.ok) {
-            messageElement.textContent = 'Cache purged successfully.';
+            messageElement.textContent = 'Cache purge request accepted.';
             messageElement.className = 'message success';
         } else {
             const errorData = await response.json();
-            messageElement.textContent = `Error: ${errorData.message || 'Failed to purge cache.'}`;
+            let message = errorData.error || errorData.message || errorData.detail || 'Failed to purge cache.';
+            if (errorData.origin?.failures?.length) {
+                const failures = errorData.origin.failures.map(failure =>
+                    `URL ${failure.index + 1} (${failure.host}): ${failure.reason}${failure.httpStatus ? ` (HTTP ${failure.httpStatus})` : ''}`
+                );
+                message += ` ${failures.join('; ')}.`;
+            }
+            if (errorData.akamai) {
+                message += ` Akamai purge: ${errorData.akamai.status}. Origin purge is incomplete; retry after resolving the origin error.`;
+            }
+            messageElement.textContent = `Error: ${message}`;
             messageElement.className = 'message error';
         }
     } catch (error) {

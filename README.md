@@ -91,10 +91,57 @@ When `originPurgeRequest` and `post_purge_request.enabled` are true, Akapurgo se
 the configured request to every URL before calling the Akamai purge API. This
 allows an Akamai property to bypass its edge cache, resolve the public URL to
 the corresponding storage headers and evict a private origin cache first. If
-that request fails or returns a non-2xx status, Akapurgo returns HTTP 502 and
-does not continue with the Akamai purge. URLs must use HTTPS and match the
-configured `post_purge_request.allowed_hosts` allowlist. The legacy
-`postPurgeRequest` field remains accepted for backward compatibility.
+that request fails, Akapurgo still attempts the Akamai purge, then returns HTTP
+502 with the outcome of each stage. This is a best-effort edge eviction: it does
+not confirm removal from the origin, and the edge may refill from stale origin
+content. Callers must retry the complete operation after fixing the origin
+failure and verify that the public content is no longer served. A CCU `201`
+means the request was accepted, not that the purge has finished.
+
+Origin requests currently accept 2xx, 404 and 412 (legacy cache-miss statuses).
+This depends on the Akamai property routing the request to the purge endpoint
+without serving a cached response or applying a normal-content failover. A
+generic 200 from an incorrectly configured property is not proof of eviction.
+
+URLs must use HTTPS and match the configured
+`post_purge_request.allowed_hosts` allowlist. All origin URLs are validated
+before either stage sends requests. Invalid URLs or more than 100 origin URLs
+return HTTP 400 with the failing index or limit; an invalid allowlist configuration
+returns HTTP 500. Adding a new CDN hostname requires explicitly updating the
+deployment's allowlist, and the hostname must have the correct Akamai purge rule.
+The legacy `postPurgeRequest` field remains accepted for backward compatibility.
+
+For example, an origin 403 followed by an accepted CCU request returns HTTP 502:
+
+```json
+{
+  "error": "Failed to purge origin cache",
+  "origin": {
+    "status": "failed",
+    "failures": [
+      {
+        "index": 0,
+        "host": "img.example.com",
+        "httpStatus": 403,
+        "reason": "Origin returned an unsuccessful status"
+      }
+    ]
+  },
+  "akamai": {
+    "status": "accepted",
+    "httpStatus": 201,
+    "response": {"httpStatus": 201, "detail": "Request accepted"}
+  }
+}
+```
+
+The `akamai.status` in a partial failure is `accepted`, `failed` (CCU did not
+accept the request), `unknown` (transport or response decoding failure), or
+`not_attempted` (request construction or signing failure). `akamai.httpStatus`
+is the actual upstream HTTP status, or 0 if no response was received. Origin
+failures report the submitted URL index and hostname without query strings,
+credentials or upstream response bodies. Requests without an origin failure
+keep the existing Akamai response format.
 
 ## Logging
 The project includes extensive logging capabilities. The logs can be configured in the config.yaml file under the logs section.  Example log fields:  
