@@ -98,10 +98,45 @@ content. Callers must retry the complete operation after fixing the origin
 failure and verify that the public content is no longer served. A CCU `201`
 means the request was accepted, not that the purge has finished.
 
-Origin requests currently accept 2xx, 404 and 412 (legacy cache-miss statuses).
-This depends on the Akamai property routing the request to the purge endpoint
-without serving a cached response or applying a normal-content failover. A
-generic 200 from an incorrectly configured property is not proof of eviction.
+Origin requests require HTTP 200 or 204 and two confirmation headers. Their
+names and expected value are configurable under `post_purge_request`:
+
+```yaml
+post_purge_request:
+  confirmation:
+    request_id_header: "X-Purge-Request-Id"
+    response_header: "X-Origin-Purge"
+    response_value: "complete"
+```
+
+These are the defaults when the settings are omitted. Set them to match the
+protocol implemented by your origin. This feature does not require a specific
+storage provider, proxy implementation, or number of cache nodes.
+
+* The origin must return the configured `response_header` exactly once, with
+  the exact `response_value`, only after completing the requested purge.
+* The `request_id_header` carries a fresh 32-character lowercase hexadecimal ID
+  generated for each URL and attempt. The origin must echo that header exactly
+  once with the same ID. Akapurgo overrides any fixed value for this header in
+  `post_purge_request.headers`.
+
+Ordinary content, missing, duplicate or stale confirmations, a different
+confirmation value, and legacy 404/412 responses are failures. Akamai CCU is
+still attempted and the response reports HTTP 502 with the origin failure.
+Invalid confirmation configuration returns HTTP 500 before either stage sends
+requests. Header names must be valid and distinct (case-insensitively); the
+confirmation value must be printable ASCII without surrounding whitespace.
+
+**Rollout requirement:** implement the confirmation protocol at the origin and
+configure any intermediaries before upgrading Akapurgo. Forward the request ID,
+preserve both response headers, and bypass caching and content failover for
+purge requests. Intermediaries must not manufacture confirmation headers. An
+endpoint that does not implement the configured protocol will fail confirmation;
+retry after all relevant endpoints have been updated.
+
+Confirmation records completion for that attempt. It does not prevent later
+cache refills or concurrent writes. Update or remove the source content first,
+and coordinate outstanding writes when a durable removal is required.
 
 URLs must use HTTPS and match the configured
 `post_purge_request.allowed_hosts` allowlist. All origin URLs are validated

@@ -17,10 +17,15 @@ post_purge_request:
   # Required allowlist: prevents arbitrary server-side requests and token leaks.
   allowed_hosts:
     - "img.example.com"
-  # Defaults to "akapurgo". Akamai rejects Go's default User-Agent with a 403.
+  # Defaults to "akapurgo"; override to match the deployment's access policy.
   #user_agent: "akapurgo"
   headers:
-    X-OVH-Purge: "$OVH_PURGE_TOKEN"
+    X-Origin-Purge-Token: "$ORIGIN_PURGE_TOKEN"
+  # These defaults can be changed to match an existing origin protocol.
+  confirmation:
+    request_id_header: "X-Purge-Request-Id"
+    response_header: "X-Origin-Purge"
+    response_value: "complete"
 
 logs:
   show_access_logs: true

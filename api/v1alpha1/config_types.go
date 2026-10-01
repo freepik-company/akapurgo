@@ -1,5 +1,11 @@
 package v1alpha1
 
+type OriginPurgeConfirmationSpec struct {
+	RequestIDHeader string `yaml:"request_id_header"`
+	ResponseHeader  string `yaml:"response_header"`
+	ResponseValue   string `yaml:"response_value"`
+}
+
 // Configuration struct
 type ConfigSpec struct {
 	Server struct {
@@ -15,11 +21,12 @@ type ConfigSpec struct {
 		AccessToken  string `yaml:"access_token"`
 	} `yaml:"akamai"`
 	PostPurgeRequest struct {
-		Enabled        bool              `yaml:"enabled"`
-		UserAgent      string            `yaml:"user_agent"`
-		TimeoutSeconds int               `yaml:"timeout_seconds"`
-		AllowedHosts   []string          `yaml:"allowed_hosts"`
-		Headers        map[string]string `yaml:"headers"`
+		Enabled        bool                        `yaml:"enabled"`
+		UserAgent      string                      `yaml:"user_agent"`
+		TimeoutSeconds int                         `yaml:"timeout_seconds"`
+		AllowedHosts   []string                    `yaml:"allowed_hosts"`
+		Headers        map[string]string           `yaml:"headers"`
+		Confirmation   OriginPurgeConfirmationSpec `yaml:"confirmation"`
 	} `yaml:"post_purge_request"`
 	Logs struct {
 		ShowAccessLogs bool `yaml:"show_access_logs"`
