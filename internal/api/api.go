@@ -5,6 +5,8 @@ import (
 	"akapurgo/internal/commons"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,14 +20,16 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
-// Akamai rejects requests carrying Go's default User-Agent
-// ("Go-http-client/1.1") with a 403, so the post-purge request never reached
-// the origin. Send our own unless the configuration overrides it.
+// Identify origin purge requests; deployments can override the User-Agent
+// to match their access policies.
 const defaultPostPurgeUserAgent = "akapurgo"
 const defaultOriginPurgeTimeout = 10 * time.Second
 const akamaiRequestTimeout = 30 * time.Second
 const maxResponseBodySize = 1 << 20
 const maxOriginPurgeURLs = 100
+const originPurgeRequestIDHeader = "X-Purge-Request-Id"
+const originPurgeConfirmationHeader = "X-Origin-Purge"
+const originPurgeConfirmationValue = "complete"
 
 func PurgeHandler(ctx v1alpha1.Context) func(c *fiber.Ctx) error {
 	originPurgeTimeout := time.Duration(ctx.Config.PostPurgeRequest.TimeoutSeconds) * time.Second
@@ -49,8 +53,12 @@ func purgeHandler(ctx v1alpha1.Context, originPurgeClient, akamaiClient *http.Cl
 	signRequest func(*http.Request) error,
 ) func(c *fiber.Ctx) error {
 	allowedOriginHosts, allowedHostsError := buildAllowedHosts(ctx.Config.PostPurgeRequest.AllowedHosts)
+	confirmation, confirmationError := buildOriginPurgeConfirmation(ctx.Config.PostPurgeRequest.Confirmation)
 	if ctx.Config.PostPurgeRequest.Enabled && allowedHostsError != nil {
 		ctx.Logger.Errorf("Invalid origin purge host configuration: %v", allowedHostsError)
+	}
+	if ctx.Config.PostPurgeRequest.Enabled && confirmationError != nil {
+		ctx.Logger.Errorf("Invalid origin purge confirmation configuration: %v", confirmationError)
 	}
 
 	return func(c *fiber.Ctx) error {
@@ -117,13 +125,18 @@ func purgeHandler(ctx v1alpha1.Context, originPurgeClient, akamaiClient *http.Cl
 					"error": "Invalid origin purge host configuration",
 				})
 			}
+			if confirmationError != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{
+					"error": "Invalid origin purge confirmation configuration",
+				})
+			}
 			validatedURLs, err := validateOriginPurgeURLs(originPaths, allowedOriginHosts)
 			if err != nil {
 				return c.Status(fiber.StatusBadRequest).JSON(map[string]string{
 					"error": err.Error(),
 				})
 			}
-			originErrors = executeOriginPurgeRequest(c.UserContext(), validatedURLs, ctx, originPurgeClient)
+			originErrors = executeOriginPurgeRequest(c.UserContext(), validatedURLs, ctx, originPurgeClient, confirmation)
 			if len(originErrors) > 0 {
 				ctx.Logger.Errorf("Failed to purge origin cache through Akamai: %v", originErrors)
 			}
@@ -246,6 +259,7 @@ func executeOriginPurgeRequest(
 	validatedURLs []*url.URL,
 	ctx v1alpha1.Context,
 	client *http.Client,
+	confirmation v1alpha1.OriginPurgeConfirmationSpec,
 ) []originPurgeFailure {
 	var requestErrors []originPurgeFailure
 
@@ -272,6 +286,17 @@ func executeOriginPurgeRequest(
 			getRequest.Header.Set(key, value)
 		}
 
+		// A fresh challenge prevents a cached purge response (or an ordinary
+		// content response) from being mistaken for this operation's success.
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			requestErrors = append(requestErrors, originPurgeFailure{Index: index, Host: validatedURL.Host,
+				Reason: "Failed to generate origin purge request ID"})
+			continue
+		}
+		requestID := hex.EncodeToString(nonce[:])
+		getRequest.Header.Set(confirmation.RequestIDHeader, requestID)
+
 		// Send the GET request
 		response, err := client.Do(getRequest)
 		if err != nil {
@@ -291,6 +316,11 @@ func executeOriginPurgeRequest(
 		if !isSuccessfulOriginPurgeStatus(response.StatusCode) {
 			requestErrors = append(requestErrors, originPurgeFailure{Index: index, Host: validatedURL.Host,
 				HTTPStatus: response.StatusCode, Reason: "Origin returned an unsuccessful status"})
+			continue
+		}
+		if !hasOriginPurgeConfirmation(response.Header, requestID, confirmation) {
+			requestErrors = append(requestErrors, originPurgeFailure{Index: index, Host: validatedURL.Host,
+				HTTPStatus: response.StatusCode, Reason: "Origin did not confirm the purge for this request"})
 			continue
 		}
 
@@ -344,11 +374,48 @@ func validateOriginPurgeURL(rawURL string, allowedHosts map[string]struct{}) (*u
 }
 
 func isSuccessfulOriginPurgeStatus(status int) bool {
-	// ngx_cache_purge returns 404 or 412, depending on its version, when the
-	// entry is already absent. Purging is idempotent, so both are successful.
-	return status >= 200 && status < 300 ||
-		status == http.StatusNotFound ||
-		status == http.StatusPreconditionFailed
+	// The origin normalizes an absent cache entry to 204. A public 404/412
+	// may come from a different route and cannot confirm a purge.
+	return status == http.StatusOK || status == http.StatusNoContent
+}
+
+func buildOriginPurgeConfirmation(config v1alpha1.OriginPurgeConfirmationSpec) (v1alpha1.OriginPurgeConfirmationSpec, error) {
+	if config.RequestIDHeader == "" {
+		config.RequestIDHeader = originPurgeRequestIDHeader
+	}
+	if config.ResponseHeader == "" {
+		config.ResponseHeader = originPurgeConfirmationHeader
+	}
+	if config.ResponseValue == "" {
+		config.ResponseValue = originPurgeConfirmationValue
+	}
+	for _, name := range []string{config.RequestIDHeader, config.ResponseHeader} {
+		for _, c := range name {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+				strings.ContainsRune("!#$%&'*+-.^_`|~", c)) {
+				return config, errors.New("confirmation headers must be valid HTTP field names")
+			}
+		}
+	}
+	if strings.EqualFold(config.RequestIDHeader, config.ResponseHeader) {
+		return config, errors.New("request ID and confirmation headers must be distinct")
+	}
+	if strings.TrimSpace(config.ResponseValue) != config.ResponseValue {
+		return config, errors.New("confirmation value must not have surrounding whitespace")
+	}
+	for _, c := range config.ResponseValue {
+		if c < 0x20 || c > 0x7e {
+			return config, errors.New("confirmation value must contain printable ASCII characters")
+		}
+	}
+	return config, nil
+}
+
+func hasOriginPurgeConfirmation(headers http.Header, requestID string, config v1alpha1.OriginPurgeConfirmationSpec) bool {
+	confirmations := headers.Values(config.ResponseHeader)
+	requestIDs := headers.Values(config.RequestIDHeader)
+	return len(confirmations) == 1 && confirmations[0] == config.ResponseValue &&
+		len(requestIDs) == 1 && requestIDs[0] == requestID
 }
 
 func sanitizeOriginPurgeRequestError(index int, requestURL *url.URL, err error) error {
